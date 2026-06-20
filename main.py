@@ -98,3 +98,10 @@ def send_email(subject, body):
 # ====================== TRAVELPAYOUTS API ======================
 
 def month_cursor(start_date, end_date):
+    current = start_date.replace(day=1)
+    while current <= end_date:
+        yield current.strftime("%Y-%m")
+        if current.month == 12:
+            current = current.replace(year=current.year + 1, month=1)
+        else:
+            current = current.replace(month=current.month + 1)
