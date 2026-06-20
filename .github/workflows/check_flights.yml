@@ -2,7 +2,9 @@ name: THY Fiyat Takip
 
 on:
   schedule:
-    - cron: "0 7 * * *"
+    - cron: "0 6 * * *"   # 08:00 TR/Almanya
+    - cron: "0 12 * * *"  # 14:00 TR/Almanya
+    - cron: "0 18 * * *"  # 20:00 TR/Almanya
   workflow_dispatch: {}
 
 jobs:
@@ -20,6 +22,13 @@ jobs:
       - name: Bağımlılıkları yükle
         run: pip install -r requirements.txt
 
+      - name: Geçmiş fiyatları cache'ten yükle
+        uses: actions/cache@v4
+        with:
+          path: /tmp/last_prices.json
+          key: last-prices-v1
+          restore-keys: last-prices-v1
+
       - name: Fiyat kontrolünü çalıştır
         run: python main.py
         env:
@@ -30,8 +39,17 @@ jobs:
           GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
           EMAIL_TO: ${{ secrets.EMAIL_TO }}
           PRICE_THRESHOLD: "200"
+          CHANGE_THRESHOLD: "5"
           ORIGIN_AIRPORTS: "DTM,DUS,CGN"
           TRANSIT_AIRPORT: "IST"
           DESTINATION_AIRPORT: "NOP"
-          MONTHS_AHEAD: "4"
+          MONTHS_AHEAD: "6"
           CURRENCY: "eur"
+          PRICES_FILE: "/tmp/last_prices.json"
+
+      - name: Güncel fiyatları cache'e kaydet
+        uses: actions/cache/save@v4
+        if: always()
+        with:
+          path: /tmp/last_prices.json
+          key: last-prices-${{ github.run_id }}
