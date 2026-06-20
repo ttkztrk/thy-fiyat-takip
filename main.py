@@ -2,24 +2,10 @@
 THY Fiyat Takip Scripti (Travelpayouts / Aviasales Data API ile)
 ==================================================================
 NRW (Dortmund / Düsseldorf / Köln-Bonn) <-> Sinop (NOP) rotasını HER İKİ
-YÖNDE (gidiş ve dönüş) AYRI AYRI takip eder. Her yön kendi başına 200 EUR
-eşiğiyle karşılaştırılır (toplanmaz) -- yani sadece gidiş ucuzsa de, sadece
-dönüş ucuzsa de, ikisi de ucuzsa da ayrı ayrı bildirim gelir.
+YÖNDE (gidiş ve dönüş) AYRI AYRI takip eder.
 
-Amadeus self-service API 17 Temmuz 2026'da tamamen kapandığı için bu script
-Travelpayouts'un (Aviasales) ücretsiz Data API'sini kullanıyor.
-
-ÖNEMLİ NOT: Sinop gibi az aranan bir rota için "NRW havalimanı <-> Sinop"
-şeklinde direkt arama yapıldığında cache'te veri bulunamayabilir (bu API
-gerçek zamanlı değil, kullanıcıların geçmiş aramalarından oluşan bir
-cache'tir). Bu yüzden her yön kendi içinde ikiye bölünüyor, örn. gidiş için:
-    1) Kalkış havalimanı -> İstanbul (IST)   [çok aranan, bol veri]
-    2) İstanbul (IST) -> Sinop (NOP)          [THY'nin iç hat seferi]
-ve iki bacağın en ucuz fiyatları toplanarak o YÖN için TAHMİNİ bir fiyat
-hesaplanıyor (dönüş için aynı mantık ters yönde uygulanır). Bu, THY'den tek
-PNR ile alınacak gerçek bilet fiyatından farklı olabilir -- bu yüzden script
-sadece "erken uyarı" amaçlıdır, bilet almadan önce mutlaka THY'nin sitesinden
-gerçek fiyatı teyit et.
+- 200 EUR altında bilet bulunursa -> Telegram'a UYARI bildirimi gönderilir.
+- Her durumda -> o ayın en ucuz gidiş ve dönüş fiyatları Telegram'a gönderilir.
 """
 
 import os
@@ -27,15 +13,16 @@ import time
 import smtplib
 from email.mime.text import MIMEText
 from datetime import date
+from collections import defaultdict
 
 import requests
 
 # ====================== AYARLAR ======================
 ORIGIN_AIRPORTS = os.environ.get("ORIGIN_AIRPORTS", "DTM,DUS,CGN").split(",")
-TRANSIT_AIRPORT = os.environ.get("TRANSIT_AIRPORT", "IST")        # İstanbul Havalimanı
-DESTINATION_AIRPORT = os.environ.get("DESTINATION_AIRPORT", "NOP")  # Sinop
+TRANSIT_AIRPORT = os.environ.get("TRANSIT_AIRPORT", "IST")
+DESTINATION_AIRPORT = os.environ.get("DESTINATION_AIRPORT", "NOP")
 PRICE_THRESHOLD = float(os.environ.get("PRICE_THRESHOLD", "200"))
-MONTHS_AHEAD = int(os.environ.get("MONTHS_AHEAD", "4"))  # kaç ay ileriye kadar bakılsın
+MONTHS_AHEAD = int(os.environ.get("MONTHS_AHEAD", "4"))
 CURRENCY = os.environ.get("CURRENCY", "eur")
 
 TRAVELPAYOUTS_TOKEN = os.environ["TRAVELPAYOUTS_TOKEN"]
@@ -51,8 +38,6 @@ EMAIL_TO = os.environ.get("EMAIL_TO")
 # ====================== TRAVELPAYOUTS API ======================
 
 def cheapest_for_month(origin: str, destination: str, month_str: str):
-    """Belirli bir ay (YYYY-MM) için origin->destination cache'teki en ucuz
-    fiyatı döner. Veri yoksa None döner."""
     params = {
         "origin": origin,
         "destination": destination,
@@ -90,8 +75,6 @@ def build_months():
 
 
 def check_direction(label, start, mid, end, month):
-    """start -> mid -> end rotasının o ay için tahmini toplam fiyatını
-    hesaplar. Veri yoksa None döner."""
     leg1 = cheapest_for_month(start, mid, month)
     time.sleep(0.3)
     leg2 = cheapest_for_month(mid, end, month)
@@ -100,7 +83,6 @@ def check_direction(label, start, mid, end, month):
     if not leg1 or not leg2:
         return None
 
-    total_price = leg1["price"] + leg2["price"]
     return {
         "label": label,
         "month": month,
@@ -108,7 +90,7 @@ def check_direction(label, start, mid, end, month):
         "leg1_date": leg1.get("departure_at", "?"),
         "leg2_price": leg2["price"],
         "leg2_date": leg2.get("departure_at", "?"),
-        "total": total_price,
+        "total": leg1["price"] + leg2["price"],
     }
 
 
@@ -121,13 +103,13 @@ def send_telegram(message: str) -> None:
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     try:
         requests.post(url, data={"chat_id": TELEGRAM_CHAT_ID, "text": message}, timeout=20)
+        print("  [Telegram] Mesaj gönderildi.")
     except Exception as e:
         print(f"  [Hata] Telegram gönderilemedi: {e}")
 
 
 def send_email(subject: str, body: str) -> None:
     if not GMAIL_ADDRESS or not GMAIL_APP_PASSWORD or not EMAIL_TO:
-        print("  [Bilgi] E-posta ayarları eksik, atlanıyor.")
         return
     msg = MIMEText(body)
     msg["Subject"] = subject
@@ -144,57 +126,93 @@ def send_email(subject: str, body: str) -> None:
 # ====================== ANA AKIŞ ======================
 
 def main():
-    print("THY fiyat takip scripti başlıyor (Travelpayouts/Aviasales Data API)...")
+    print("THY fiyat takip scripti başlıyor...")
     months = build_months()
 
-    cheap_offers = []
+    cheap_offers = []  # 200€ altındakiler
+    # Ay bazında tüm bulunan fiyatlar: {month: [offer, ...]}
+    all_offers = defaultdict(list)
+
     for raw_origin in ORIGIN_AIRPORTS:
         origin = raw_origin.strip()
         for month in months:
+            # GİDİŞ
             print(f"Kontrol (Gidiş): {origin} -> {TRANSIT_AIRPORT} -> {DESTINATION_AIRPORT}, {month}")
             outbound = check_direction(
-                f"Gidiş ({origin} → {DESTINATION_AIRPORT})",
+                f"Gidiş ({origin}→{DESTINATION_AIRPORT})",
                 origin, TRANSIT_AIRPORT, DESTINATION_AIRPORT, month,
             )
             if outbound:
+                print(f"  Tahmini: {outbound['total']:.0f} {CURRENCY.upper()} "
+                      f"({outbound['leg1_price']:.0f}+{outbound['leg2_price']:.0f})")
+                all_offers[month].append(outbound)
                 if outbound["total"] <= PRICE_THRESHOLD:
                     cheap_offers.append(outbound)
             else:
-                print("  Bu ay için yeterli cache verisi yok, atlanıyor.")
+                print("  Cache verisi yok, atlanıyor.")
 
+            # DÖNÜŞ
             print(f"Kontrol (Dönüş): {DESTINATION_AIRPORT} -> {TRANSIT_AIRPORT} -> {origin}, {month}")
             inbound = check_direction(
-                f"Dönüş ({DESTINATION_AIRPORT} → {origin})",
+                f"Dönüş ({DESTINATION_AIRPORT}→{origin})",
                 DESTINATION_AIRPORT, TRANSIT_AIRPORT, origin, month,
             )
             if inbound:
+                print(f"  Tahmini: {inbound['total']:.0f} {CURRENCY.upper()} "
+                      f"({inbound['leg1_price']:.0f}+{inbound['leg2_price']:.0f})")
+                all_offers[month].append(inbound)
                 if inbound["total"] <= PRICE_THRESHOLD:
                     cheap_offers.append(inbound)
             else:
-                print("  Bu ay için yeterli cache verisi yok, atlanıyor.")
+                print("  Cache verisi yok, atlanıyor.")
 
+    # --- UCUZ BİLET UYARISI ---
     if cheap_offers:
         cheap_offers.sort(key=lambda x: x["total"])
-        lines = [
-            f"{PRICE_THRESHOLD:.0f} {CURRENCY.upper()} altında TAHMİNİ "
-            f"{len(cheap_offers)} bilet/yön bulundu (her yön kendi içinde "
-            f"iki bacağın toplamı, gerçek bilet fiyatı farklı olabilir):\n"
-        ]
-        for o in cheap_offers[:15]:
+        lines = [f"🚨 {PRICE_THRESHOLD:.0f} {CURRENCY.upper()} ALTI BİLET BULUNDU!\n"]
+        for o in cheap_offers[:10]:
             lines.append(
-                f"• {o['label']} | Ay: {o['month']} | "
-                f"1. bacak: {o['leg1_price']:.0f} {CURRENCY.upper()} ({o['leg1_date']}) | "
-                f"2. bacak: {o['leg2_price']:.0f} {CURRENCY.upper()} ({o['leg2_date']}) | "
-                f"TOPLAM ≈ {o['total']:.0f} {CURRENCY.upper()}"
+                f"✅ {o['label']} | {o['month']} | "
+                f"≈ {o['total']:.0f} {CURRENCY.upper()} "
+                f"({o['leg1_price']:.0f}+{o['leg2_price']:.0f})"
             )
-        lines.append("\n⚠️ Bilet almadan önce THY sitesinden gerçek fiyatı teyit et.")
+        lines.append("\n⚠️ Bilet almadan önce THY sitesinden teyit et!")
         message = "\n".join(lines)
         print(message)
         send_telegram(message)
-        send_email("✈️ Ucuz THY Bileti Olabilir!", message)
+        send_email("✈️ Ucuz THY Bileti!", message)
+
+    # --- AYLIK EN UCUZ ÖZET (her zaman gönderilir) ---
+    if all_offers:
+        lines = ["📊 Aylık En Ucuz Fiyat Özeti (tahmini, iki bacak toplamı):\n"]
+        for month in sorted(all_offers.keys()):
+            offers = all_offers[month]
+            if not offers:
+                continue
+            # Gidiş ve dönüş en ucuzlarını ayrı bul
+            outbounds = [o for o in offers if "Gidiş" in o["label"]]
+            inbounds = [o for o in offers if "Dönüş" in o["label"]]
+            lines.append(f"📅 {month}:")
+            if outbounds:
+                best_out = min(outbounds, key=lambda x: x["total"])
+                lines.append(f"  ✈️ Gidiş en ucuz: {best_out['label']} → "
+                             f"{best_out['total']:.0f} {CURRENCY.upper()} "
+                             f"({best_out['leg1_price']:.0f}+{best_out['leg2_price']:.0f})")
+            if inbounds:
+                best_in = min(inbounds, key=lambda x: x["total"])
+                lines.append(f"  🔙 Dönüş en ucuz: {best_in['label']} → "
+                             f"{best_in['total']:.0f} {CURRENCY.upper()} "
+                             f"({best_in['leg1_price']:.0f}+{best_in['leg2_price']:.0f})")
+        lines.append("\n⚠️ Bilet almadan önce THY sitesinden teyit et.")
+        summary = "\n".join(lines)
+        print(summary)
+        send_telegram(summary)
+        if EMAIL_TO:
+            send_email("✈️ THY Aylık Fiyat Özeti", summary)
     else:
-        print(f"Bu çalıştırmada {PRICE_THRESHOLD:.0f} {CURRENCY.upper()} altında "
-              f"hiçbir yön bulunamadı (veya cache'te yeterli veri yoktu).")
+        msg = "ℹ️ Bu çalıştırmada hiçbir ay için cache verisi bulunamadı."
+        print(msg)
+        send_telegram(msg)
 
 
 if __name__ == "__main__":
