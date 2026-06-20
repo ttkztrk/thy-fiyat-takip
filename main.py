@@ -2,18 +2,26 @@
 THY Fiyat Takip Scripti (Travelpayouts / Aviasales Data API ile)
 ==================================================================
 NRW (Dortmund / Düsseldorf / Köln-Bonn) <-> Sinop (NOP) rotasını HER İKİ
-YÖNDE (gidiş ve dönüş) AYRI AYRI takip eder.
+YÖNDE (gidiş ve dönüş) AYRI AYRI takip eder. 6 ay ileriye bakar.
 
-- 200 EUR altında bilet bulunursa -> Telegram'a UYARI bildirimi gönderilir.
-- Her durumda -> o ayın en ucuz gidiş ve dönüş fiyatları Telegram'a gönderilir.
+Günde 3 kez çalışır. Bildirim mantığı:
+  - 200 EUR altı bilet bulunursa -> HER ZAMAN Telegram + E-posta UYARI gönderilir.
+  - Fiyatlar bir önceki taramaya göre değiştiyse -> Telegram özet gönderilir.
+  - Hiçbir değişiklik yoksa -> bildirim gönderilmez (Telegram dolmasın).
+
+Fiyat geçmişi /tmp/last_prices.json dosyasında saklanır.
+(GitHub Actions her çalıştırmada temiz bir ortam başlatır, bu yüzden
+geçmiş fiyatları GitHub Actions Cache'te saklıyoruz.)
 """
 
 import os
+import json
 import time
 import smtplib
 from email.mime.text import MIMEText
 from datetime import date
 from collections import defaultdict
+from pathlib import Path
 
 import requests
 
@@ -22,17 +30,42 @@ ORIGIN_AIRPORTS = os.environ.get("ORIGIN_AIRPORTS", "DTM,DUS,CGN").split(",")
 TRANSIT_AIRPORT = os.environ.get("TRANSIT_AIRPORT", "IST")
 DESTINATION_AIRPORT = os.environ.get("DESTINATION_AIRPORT", "NOP")
 PRICE_THRESHOLD = float(os.environ.get("PRICE_THRESHOLD", "200"))
-MONTHS_AHEAD = int(os.environ.get("MONTHS_AHEAD", "4"))
+MONTHS_AHEAD = int(os.environ.get("MONTHS_AHEAD", "6"))
 CURRENCY = os.environ.get("CURRENCY", "eur")
+# Fiyat değişikliği eşiği: bu EUR'dan fazla değişirse bildirim gönderilir
+CHANGE_THRESHOLD = float(os.environ.get("CHANGE_THRESHOLD", "5"))
 
 TRAVELPAYOUTS_TOKEN = os.environ["TRAVELPAYOUTS_TOKEN"]
-
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
-
 GMAIL_ADDRESS = os.environ.get("GMAIL_ADDRESS")
 GMAIL_APP_PASSWORD = os.environ.get("GMAIL_APP_PASSWORD")
 EMAIL_TO = os.environ.get("EMAIL_TO")
+
+# Geçmiş fiyatların saklandığı dosya (GitHub Actions cache ile kalıcı hale getirilir)
+PRICES_FILE = Path(os.environ.get("PRICES_FILE", "/tmp/last_prices.json"))
+
+
+# ====================== GEÇMİŞ FİYATLAR ======================
+
+def load_last_prices() -> dict:
+    if PRICES_FILE.exists():
+        try:
+            return json.loads(PRICES_FILE.read_text())
+        except Exception:
+            pass
+    return {}
+
+
+def save_prices(prices: dict):
+    try:
+        PRICES_FILE.write_text(json.dumps(prices, ensure_ascii=False, indent=2))
+    except Exception as e:
+        print(f"  [Uyarı] Fiyat geçmişi kaydedilemedi: {e}")
+
+
+def price_key(label, month):
+    return f"{label}|{month}"
 
 
 # ====================== TRAVELPAYOUTS API ======================
@@ -54,13 +87,10 @@ def cheapest_for_month(origin: str, destination: str, month_str: str):
         print(f"  [Uyarı] {origin}->{destination} ({month_str}): "
               f"{resp.status_code} {resp.text[:150]}")
         return None
-
     dest_data = resp.json().get("data", {}).get(destination)
     if not dest_data:
         return None
-
-    cheapest = min(dest_data.values(), key=lambda x: x["price"])
-    return cheapest
+    return min(dest_data.values(), key=lambda x: x["price"])
 
 
 def build_months():
@@ -79,10 +109,8 @@ def check_direction(label, start, mid, end, month):
     time.sleep(0.3)
     leg2 = cheapest_for_month(mid, end, month)
     time.sleep(0.3)
-
     if not leg1 or not leg2:
         return None
-
     return {
         "label": label,
         "month": month,
@@ -111,7 +139,7 @@ def send_telegram(message: str) -> None:
 def send_email(subject: str, body: str) -> None:
     if not GMAIL_ADDRESS or not GMAIL_APP_PASSWORD or not EMAIL_TO:
         return
-    msg = MIMEText(body)
+    msg = MIMEText(body, "plain", "utf-8")
     msg["Subject"] = subject
     msg["From"] = GMAIL_ADDRESS
     msg["To"] = EMAIL_TO
@@ -119,6 +147,7 @@ def send_email(subject: str, body: str) -> None:
         with smtplib.SMTP_SSL("smtp.gmail.com", 465) as server:
             server.login(GMAIL_ADDRESS, GMAIL_APP_PASSWORD)
             server.send_message(msg)
+        print("  [E-posta] Gönderildi.")
     except Exception as e:
         print(f"  [Hata] E-posta gönderilemedi: {e}")
 
@@ -126,11 +155,13 @@ def send_email(subject: str, body: str) -> None:
 # ====================== ANA AKIŞ ======================
 
 def main():
-    print("THY fiyat takip scripti başlıyor...")
+    print("THY fiyat takip scripti başlıyor (6 aylık tarama)...")
     months = build_months()
+    last_prices = load_last_prices()
+    current_prices = {}
 
-    cheap_offers = []  # 200€ altındakiler
-    # Ay bazında tüm bulunan fiyatlar: {month: [offer, ...]}
+    cheap_offers = []       # 200€ altındakiler
+    changed_offers = []     # Fiyatı değişenler
     all_offers = defaultdict(list)
 
     for raw_origin in ORIGIN_AIRPORTS:
@@ -146,8 +177,18 @@ def main():
                 print(f"  Tahmini: {outbound['total']:.0f} {CURRENCY.upper()} "
                       f"({outbound['leg1_price']:.0f}+{outbound['leg2_price']:.0f})")
                 all_offers[month].append(outbound)
+                key = price_key(outbound["label"], month)
+                current_prices[key] = outbound["total"]
+                # 200€ altı mı?
                 if outbound["total"] <= PRICE_THRESHOLD:
                     cheap_offers.append(outbound)
+                # Fiyat değişti mi?
+                if key in last_prices:
+                    diff = last_prices[key] - outbound["total"]
+                    if abs(diff) >= CHANGE_THRESHOLD:
+                        outbound["prev_price"] = last_prices[key]
+                        outbound["diff"] = diff
+                        changed_offers.append(outbound)
             else:
                 print("  Cache verisi yok, atlanıyor.")
 
@@ -161,12 +202,23 @@ def main():
                 print(f"  Tahmini: {inbound['total']:.0f} {CURRENCY.upper()} "
                       f"({inbound['leg1_price']:.0f}+{inbound['leg2_price']:.0f})")
                 all_offers[month].append(inbound)
+                key = price_key(inbound["label"], month)
+                current_prices[key] = inbound["total"]
                 if inbound["total"] <= PRICE_THRESHOLD:
                     cheap_offers.append(inbound)
+                if key in last_prices:
+                    diff = last_prices[key] - inbound["total"]
+                    if abs(diff) >= CHANGE_THRESHOLD:
+                        inbound["prev_price"] = last_prices[key]
+                        inbound["diff"] = diff
+                        changed_offers.append(inbound)
             else:
                 print("  Cache verisi yok, atlanıyor.")
 
-    # --- UCUZ BİLET UYARISI ---
+    # Fiyatları kaydet
+    save_prices(current_prices)
+
+    # --- 1. UCUZ BİLET UYARISI (her zaman gönderilir, 200€ altıysa) ---
     if cheap_offers:
         cheap_offers.sort(key=lambda x: x["total"])
         lines = [f"🚨 {PRICE_THRESHOLD:.0f} {CURRENCY.upper()} ALTI BİLET BULUNDU!\n"]
@@ -180,39 +232,27 @@ def main():
         message = "\n".join(lines)
         print(message)
         send_telegram(message)
-        send_email("✈️ Ucuz THY Bileti!", message)
+        send_email("🚨 Ucuz THY Bileti Bulundu!", message)
 
-    # --- AYLIK EN UCUZ ÖZET (her zaman gönderilir) ---
-    if all_offers:
-        lines = ["📊 Aylık En Ucuz Fiyat Özeti (tahmini, iki bacak toplamı):\n"]
-        for month in sorted(all_offers.keys()):
-            offers = all_offers[month]
-            if not offers:
-                continue
-            # Gidiş ve dönüş en ucuzlarını ayrı bul
-            outbounds = [o for o in offers if "Gidiş" in o["label"]]
-            inbounds = [o for o in offers if "Dönüş" in o["label"]]
-            lines.append(f"📅 {month}:")
-            if outbounds:
-                best_out = min(outbounds, key=lambda x: x["total"])
-                lines.append(f"  ✈️ Gidiş en ucuz: {best_out['label']} → "
-                             f"{best_out['total']:.0f} {CURRENCY.upper()} "
-                             f"({best_out['leg1_price']:.0f}+{best_out['leg2_price']:.0f})")
-            if inbounds:
-                best_in = min(inbounds, key=lambda x: x["total"])
-                lines.append(f"  🔙 Dönüş en ucuz: {best_in['label']} → "
-                             f"{best_in['total']:.0f} {CURRENCY.upper()} "
-                             f"({best_in['leg1_price']:.0f}+{best_in['leg2_price']:.0f})")
+    # --- 2. FİYAT DEĞİŞİKLİĞİ BİLDİRİMİ ---
+    elif changed_offers:
+        changed_offers.sort(key=lambda x: x["total"])
+        lines = ["📉 Fiyat Değişikliği Tespit Edildi:\n"]
+        for o in changed_offers[:10]:
+            arrow = "📉" if o["diff"] > 0 else "📈"
+            lines.append(
+                f"{arrow} {o['label']} | {o['month']} | "
+                f"{o['prev_price']:.0f} → {o['total']:.0f} {CURRENCY.upper()} "
+                f"({'+' if o['diff'] > 0 else ''}{o['diff']:.0f}€)"
+            )
         lines.append("\n⚠️ Bilet almadan önce THY sitesinden teyit et.")
-        summary = "\n".join(lines)
-        print(summary)
-        send_telegram(summary)
-        if EMAIL_TO:
-            send_email("✈️ THY Aylık Fiyat Özeti", summary)
+        message = "\n".join(lines)
+        print(message)
+        send_telegram(message)
+
+    # --- 3. DEĞİŞİKLİK YOK ---
     else:
-        msg = "ℹ️ Bu çalıştırmada hiçbir ay için cache verisi bulunamadı."
-        print(msg)
-        send_telegram(msg)
+        print("Fiyatlarda önemli bir değişiklik yok, bildirim gönderilmedi.")
 
 
 if __name__ == "__main__":
