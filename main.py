@@ -4,26 +4,22 @@ THY fiyat takip scripti (Travelpayouts / Aviasales Data API)
 NRW (Dortmund / Düsseldorf / Köln-Bonn) <-> Sinop (NOP) rotasını
 gidiş ve dönüş olarak takip eder.
 
-Bildirim mantigi:
-  - 200€ altı varsa: ayrıca kısa "FIRSAT" bildirimi gönderilir.
-  - Uzun bildirimler ay ay bölünmez; tek özet mesaj gönderilir.
-  - 200€ altı yoksa özette sadece en ucuz gidiş, en ucuz dönüş ve
-    en büyük fiyat düşüşü gösterilir.
-  - Fırsat listesi en fazla ilk 3 sonucu gösterir.
-
-Telegram komutları:
-  /ara YYYY-MM-DD YYYY-MM-DD   -> Gidiş + dönüş ara
-  /gidis YYYY-MM-DD YYYY-MM-DD -> Sadece gidiş ara
-  /donus YYYY-MM-DD YYYY-MM-DD -> Sadece dönüş ara
-  /yardim                      -> Komutları listeler
+Bildirim mantığı:
+  - Her gün 200€ altı bilet varsa kısa "FIRSAT" bildirimi gönderilir.
+  - Bilet ucuzlarsa kaç euro ucuzladığı yazılır: "73€ ucuzladı".
+  - Değişiklik yoksa otomatik bildirim gönderilmez.
+  - Her ay için en ucuz gidiş ve en ucuz dönüş takip edilir.
+  - Telegram'da "selam" yazınca bot tarih ve yön sorup ona göre arama yapar.
 """
 
+import json
 import logging
 import os
 import smtplib
 import time
-from datetime import datetime
+from datetime import date, datetime, timedelta
 from email.mime.text import MIMEText
+from pathlib import Path
 
 import requests
 
@@ -35,6 +31,9 @@ ORIGIN_AIRPORTS = os.environ.get("ORIGIN_AIRPORTS", "DTM,DUS,CGN").split(",")
 TRANSIT_AIRPORT = os.environ.get("TRANSIT_AIRPORT", "IST")
 DESTINATION_AIRPORT = os.environ.get("DESTINATION_AIRPORT", "NOP")
 PRICE_THRESHOLD = float(os.environ.get("PRICE_THRESHOLD", "200"))
+CHANGE_THRESHOLD = float(os.environ.get("CHANGE_THRESHOLD", "5"))
+MONTHS_AHEAD = int(os.environ.get("MONTHS_AHEAD", "6"))
+AUTO_CHECK_HOUR = int(os.environ.get("AUTO_CHECK_HOUR", "8"))
 CURRENCY = os.environ.get("CURRENCY", "eur")
 
 TRAVELPAYOUTS_TOKEN = os.environ["TRAVELPAYOUTS_TOKEN"]
@@ -46,21 +45,29 @@ GMAIL_APP_PASSWORD = os.environ.get("GMAIL_APP_PASSWORD")
 EMAIL_TO = os.environ.get("EMAIL_TO")
 
 TELEGRAM_API = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}"
+STATE_FILE = Path(os.environ.get("STATE_FILE", "/tmp/thy_price_state.json"))
+
+MONTH_TR = {
+    1: "Ocak", 2: "Şubat", 3: "Mart", 4: "Nisan",
+    5: "Mayıs", 6: "Haziran", 7: "Temmuz", 8: "Ağustos",
+    9: "Eylül", 10: "Ekim", 11: "Kasım", 12: "Aralık",
+}
+
+USER_STATES = {}
 
 
 # ====================== TELEGRAM ======================
 
-def tg_send(chat_id, text):
+def tg_send(chat_id, text, keyboard=None):
+    data = {
+        "chat_id": chat_id,
+        "text": text,
+        "disable_web_page_preview": True,
+    }
+    if keyboard:
+        data["reply_markup"] = json.dumps(keyboard, ensure_ascii=False)
     try:
-        requests.post(
-            f"{TELEGRAM_API}/sendMessage",
-            data={
-                "chat_id": chat_id,
-                "text": text,
-                "disable_web_page_preview": True,
-            },
-            timeout=20,
-        )
+        requests.post(f"{TELEGRAM_API}/sendMessage", data=data, timeout=20)
     except Exception as e:
         log.error(f"Telegram gönderme hatası: {e}")
 
@@ -77,31 +84,17 @@ def tg_get_updates(offset=None):
         return []
 
 
-# ====================== E-POSTA ======================
-
-def send_email(subject, body):
-    if not GMAIL_ADDRESS or not GMAIL_APP_PASSWORD or not EMAIL_TO:
-        return
-    msg = MIMEText(body, "plain", "utf-8")
-    msg["Subject"] = subject
-    msg["From"] = GMAIL_ADDRESS
-    msg["To"] = EMAIL_TO
-    try:
-        with smtplib.SMTP_SSL("smtp.gmail.com", 465) as server:
-            server.login(GMAIL_ADDRESS, GMAIL_APP_PASSWORD)
-            server.send_message(msg)
-        log.info("E-posta gönderildi.")
-    except Exception as e:
-        log.error(f"E-posta hatası: {e}")
+def direction_keyboard():
+    return {
+        "keyboard": [[
+            {"text": "Gidiş"},
+            {"text": "Dönüş"},
+            {"text": "Gidiş + Dönüş"},
+        ]],
+        "resize_keyboard": True,
+        "one_time_keyboard": True,
+    }
 
 
-# ====================== TRAVELPAYOUTS API ======================
-
-def month_cursor(start_date, end_date):
-    current = start_date.replace(day=1)
-    while current <= end_date:
-        yield current.strftime("%Y-%m")
-        if current.month == 12:
-            current = current.replace(year=current.year + 1, month=1)
-        else:
-            current = current.replace(month=current.month + 1)
+def remove_keyboard():
+    return {"remove_keyboard": True}
