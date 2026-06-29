@@ -2,50 +2,38 @@ name: Ucus Fiyat Takip
 
 on:
   schedule:
-    - cron: "0 6 * * *"   # 08:00 TR/Almanya
-    - cron: "0 12 * * *"  # 14:00 TR/Almanya
-    - cron: "0 18 * * *"  # 20:00 TR/Almanya
+    - cron: "0 6 * * *"
+    - cron: "0 12 * * *"
+    - cron: "0 18 * * *"
   workflow_dispatch: {}
 
 jobs:
   check-prices:
     runs-on: ubuntu-latest
     steps:
-      - name: Repoyu cek
-        uses: actions/checkout@v4
-
-      - name: Python kur
-        uses: actions/setup-python@v5
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-
-      - name: Bagimlilikları yukle
-        run: pip install -r requirements.txt
-
-      - name: Gecmis fiyatlari cacheten yukle
-        uses: actions/cache@v4
+      - run: pip install -r requirements.txt
+      - uses: actions/cache@v4
         with:
           path: /tmp/last_prices.json
-          key: last-prices-v1
-          restore-keys: last-prices-v1
-
-      - name: Fiyat kontrolu
-        run: python main.py
+          key: prices-v1
+          restore-keys: prices-v1
+      - run: python main.py
         env:
-          KIWI_API_KEY:        ${{ secrets.KIWI_API_KEY }}
+          TRAVELPAYOUTS_TOKEN: ${{ secrets.TRAVELPAYOUTS_TOKEN }}
           TELEGRAM_BOT_TOKEN:  ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID:    ${{ secrets.TELEGRAM_CHAT_ID }}
           GMAIL_ADDRESS:       ${{ secrets.GMAIL_ADDRESS }}
           GMAIL_APP_PASSWORD:  ${{ secrets.GMAIL_APP_PASSWORD }}
           EMAIL_TO:            ${{ secrets.EMAIL_TO }}
-          PRICE_THRESHOLD:     "200"
-          CHANGE_THRESHOLD:    "5"
-          MONTHS_AHEAD:        "6"
+          THRESHOLD_OUTBOUND:  "200"
+          THRESHOLD_INBOUND:   "200"
           PRICES_FILE:         "/tmp/last_prices.json"
-
-      - name: Guncel fiyatlari cachee kaydet
-        uses: actions/cache/save@v4
+      - uses: actions/cache/save@v4
         if: always()
         with:
           path: /tmp/last_prices.json
-          key: last-prices-${{ github.run_id }}
+          key: prices-${{ github.run_id }}
