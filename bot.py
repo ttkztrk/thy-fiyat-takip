@@ -1,9 +1,8 @@
 """
-Uçuş Fiyat Takip - İnteraktif Telegram Botu
-Kiwi Tequila API - tüm havayolları - butonlu arayüz
+Uçuş fiyat takip botu - Türkçe, sade, arkadaş gibi konuşur
 """
 
-import os, time, logging, smtplib
+import os, logging, json, smtplib
 from email.mime.text import MIMEText
 from datetime import datetime
 import requests
@@ -14,477 +13,476 @@ from telegram.ext import (
     filters, ContextTypes
 )
 
-logging.basicConfig(
-    format="%(asctime)s %(levelname)s %(message)s",
-    level=logging.INFO
-)
-log = logging.getLogger(__name__)
+logging.basicConfig(level=logging.INFO)
 
-# ── Env ───────────────────────────────────────────────────
-KIWI_KEY   = os.environ["KIWI_API_KEY"]
-TG_TOKEN   = os.environ["TELEGRAM_BOT_TOKEN"]
-GMAIL_ADDR = os.environ.get("GMAIL_ADDRESS")
-GMAIL_PASS = os.environ.get("GMAIL_APP_PASSWORD")
-EMAIL_TO   = os.environ.get("EMAIL_TO")
-THRESHOLD  = float(os.environ.get("PRICE_THRESHOLD", "200"))
+TOKEN     = os.environ["TRAVELPAYOUTS_TOKEN"]
+TG_TOKEN  = os.environ["TELEGRAM_BOT_TOKEN"]
+GMAIL     = os.environ.get("GMAIL_ADDRESS", "")
+GPASS     = os.environ.get("GMAIL_APP_PASSWORD", "")
+MAILTO    = os.environ.get("EMAIL_TO", "")
+TRANSIT   = "IST"
+CURRENCY  = "eur"
 
-# ── Conversation states ────────────────────────────────────
-(S_ORIGIN, S_DEST, S_TRIP, S_DEP_DATE, S_RET_DATE,
- S_AIRLINE, S_RESULTS, S_CONFIRM) = range(8)
+MONTH_TR = {1:"Ocak",2:"Şubat",3:"Mart",4:"Nisan",5:"Mayıs",6:"Haziran",
+            7:"Temmuz",8:"Ağustos",9:"Eylül",10:"Ekim",11:"Kasım",12:"Aralık"}
 
-# ── Sabit veriler ──────────────────────────────────────────
-AIRPORT_OPTS = [
-    ("✈️ Dortmund (DTM)",   "DTM"),
-    ("✈️ Düsseldorf (DUS)", "DUS"),
-    ("✈️ Köln/Bonn (CGN)",  "CGN"),
-    ("🌍 Hepsini Ara",       "ALL"),
-]
-DEST_OPTS = [
-    ("🏖 Sinop (NOP)",       "NOP"),
-    ("🌆 İstanbul (IST)",    "IST"),
-    ("✏️ Başka şehir yaz",   "CUSTOM"),
-]
-AIRLINE_OPTS = [
-    ("🌍 Tüm Havayolları",   "all"),
-    ("🇹🇷 THY",              "TK"),
-    ("🟠 Pegasus",           "PC"),
-    ("🟡 SunExpress",        "XQ"),
-]
-MONTH_TR = {
-    1:"Ocak",2:"Şubat",3:"Mart",4:"Nisan",5:"Mayıs",6:"Haziran",
-    7:"Temmuz",8:"Ağustos",9:"Eylül",10:"Ekim",11:"Kasım",12:"Aralık"
-}
-AIRLINE_NAMES = {
-    "TK":"Turkish Airlines","PC":"Pegasus","XQ":"SunExpress",
-    "W6":"Wizz Air","FR":"Ryanair","LH":"Lufthansa",
-    "VY":"Vueling","U2":"easyJet",
-}
+# Conversation states
+(S_MENU, S_KALKIS, S_VARIS_ONAY, S_VARIS_YAZ, S_YON,
+ S_AY, S_ESIK_ONA, S_ESIK_YAZ) = range(8)
 
-# ── Yardımcılar ───────────────────────────────────────────
+# ── Yardımcı ──────────────────────────────────────────────
 
 def get_try_rate():
     try:
-        r = requests.get(
-            "https://api.frankfurter.app/latest?from=EUR&to=TRY",
-            timeout=8
-        )
+        r = requests.get("https://api.frankfurter.app/latest?from=EUR&to=TRY", timeout=8)
         return r.json()["rates"]["TRY"]
     except:
         return 38.0
 
-def fmt_dt(ts):
-    """Unix timestamp → '15 Temmuz 2026, 07:30'"""
+def fmt_date(s):
     try:
-        d = datetime.utcfromtimestamp(ts)
-        return f"{d.day} {MONTH_TR[d.month]} {d.year}, {d.strftime('%H:%M')}"
+        p = s[:10].split("-")
+        return f"{int(p[2])} {MONTH_TR[int(p[1])]} {p[0]}"
     except:
-        return "?"
+        return s
 
-def parse_date(text):
-    """Birden fazla formatı destekler → DD/MM/YYYY döner ya da None."""
-    text = text.strip().replace(".", "/").replace("-", "/")
-    for fmt in ("%d/%m/%Y", "%Y/%m/%d", "%d/%m/%y"):
-        try:
-            return datetime.strptime(text, fmt).strftime("%d/%m/%Y")
-        except:
-            pass
-    return None
+def cheapest(origin, dest, month_str):
+    try:
+        r = requests.get(
+            "https://api.travelpayouts.com/v1/prices/cheap",
+            params={"origin": origin, "destination": dest,
+                    "depart_date": month_str, "currency": CURRENCY,
+                    "token": TOKEN},
+            timeout=20,
+        )
+        if r.status_code != 200: return None
+        data = r.json().get("data", {}).get(dest)
+        if not data: return None
+        best = min(data.values(), key=lambda x: x["price"])
+        dep  = best.get("departure_at", "")
+        link = best.get("link", "")
+        return {
+            "price": float(best["price"]),
+            "date":  dep[:10] if dep else month_str,
+            "link":  f"https://www.aviasales.com/search/{link}" if link else "",
+        }
+    except:
+        return None
 
-def kb(buttons):
-    """buttons: [(label, callback_data), ...] → InlineKeyboardMarkup"""
-    return InlineKeyboardMarkup(
-        [[InlineKeyboardButton(lbl, callback_data=data)]
-         for lbl, data in buttons]
-    )
+def search_route(origin, dest, month_str):
+    """İki bacak: origin→IST→dest, toplam fiyat + link döner."""
+    leg1 = cheapest(origin, TRANSIT, month_str)
+    leg2 = cheapest(TRANSIT, dest, month_str)
+    if not leg1 or not leg2:
+        return None
+    return {
+        "total": leg1["price"] + leg2["price"],
+        "leg1":  leg1,
+        "leg2":  leg2,
+    }
 
-def kb_row(buttons):
-    """İki sütun yerleşim."""
+def kb(buttons, cols=1):
     rows = []
-    for i in range(0, len(buttons), 2):
-        row = [InlineKeyboardButton(b[0], callback_data=b[1])
-               for b in buttons[i:i+2]]
+    row  = []
+    for i, (lbl, data) in enumerate(buttons):
+        row.append(InlineKeyboardButton(lbl, callback_data=data))
+        if len(row) == cols:
+            rows.append(row)
+            row = []
+    if row:
         rows.append(row)
     return InlineKeyboardMarkup(rows)
 
-# ── Kiwi API ──────────────────────────────────────────────
-
-def search_kiwi(fly_from, fly_to, date_from, date_to,
-                return_from=None, return_to=None,
-                airline=None, limit=5):
-    params = {
-        "fly_from": fly_from, "fly_to": fly_to,
-        "date_from": date_from, "date_to": date_to,
-        "curr": "EUR", "limit": limit, "sort": "price",
-        "partner_market": "de", "adults": 1,
-        "max_stopovers": 2,
-    }
-    if return_from:
-        params["return_from"] = return_from
-        params["return_to"]   = return_to or return_from
-    if airline and airline != "all":
-        params["select_airlines"] = airline
-
-    try:
-        r = requests.get(
-            "https://tequila.kiwi.com/v2/search",
-            headers={"apikey": KIWI_KEY},
-            params=params, timeout=30,
-        )
-        if r.status_code == 200:
-            return r.json().get("data", [])
-        log.warning(f"Kiwi {r.status_code}: {r.text[:150]}")
-    except Exception as e:
-        log.error(f"Kiwi hata: {e}")
-    return []
-
-def format_flights(flights, rate, trip_type="one"):
-    """Uçuş listesini okunabilir metin + link listesi olarak döner."""
-    if not flights:
-        return "❌ Sonuç bulunamadı.", []
-
-    lines = []
-    links = []
-    emojis = ["1️⃣","2️⃣","3️⃣","4️⃣","5️⃣"]
-
-    for i, f in enumerate(flights[:5]):
-        price    = float(f["price"])
-        try_price = price * rate
-        airline  = AIRLINE_NAMES.get(f.get("airlines",["?"])[0],
-                                     f.get("airlines",["?"])[0])
-        dep      = fmt_dt(f.get("dTime", 0))
-        arr      = fmt_dt(f.get("aTime", 0))
-        frm      = f.get("flyFrom","?")
-        to       = f.get("flyTo","?")
-        link     = f.get("deep_link","")
-
-        cheap_tag = " 🔥" if price <= 200 else ""
-        lines += [
-            f"{emojis[i]} {airline}{cheap_tag}",
-            f"   {frm} → {to}",
-            f"   🛫 {dep}",
-            f"   🛬 {arr}",
-            f"   💶 {price:.0f} € ({try_price:,.0f} ₺)",
-            "",
-        ]
-        links.append(link)
-
-    return "\n".join(lines), links
-
-# ── E-posta ───────────────────────────────────────────────
-
 def send_mail(subject, body):
-    if not all([GMAIL_ADDR, GMAIL_PASS, EMAIL_TO]):
-        return
+    if not all([GMAIL, GPASS, MAILTO]): return
     msg = MIMEText(body, "plain", "utf-8")
     msg["Subject"] = subject
-    msg["From"]    = GMAIL_ADDR
-    msg["To"]      = EMAIL_TO
+    msg["From"] = GMAIL
+    msg["To"]   = MAILTO
     try:
         with smtplib.SMTP_SSL("smtp.gmail.com", 465) as s:
-            s.login(GMAIL_ADDR, GMAIL_PASS)
+            s.login(GMAIL, GPASS)
             s.send_message(msg)
-    except Exception as e:
-        log.error(f"Mail hata: {e}")
+    except: pass
 
-# ── Conversation Handlers ──────────────────────────────────
+# ── Ana menü ──────────────────────────────────────────────
 
 async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     ctx.user_data.clear()
+    text = update.message.text.lower() if update.message else ""
+    selamlama = "Selam! 👋" if any(w in text for w in ["selam","merhaba","hi","hey","hello"]) else "Ne yapmak istersin?"
     await update.message.reply_text(
-        "✈️ Merhaba! Uçuş araması yapalım.\n\n"
-        "Nereden uçmak istiyorsun?",
-        reply_markup=kb_row(AIRPORT_OPTS)
-    )
-    return S_ORIGIN
-
-async def origin_chosen(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query
-    await q.answer()
-    ctx.user_data["origin"] = q.data
-    label = next(l for l, d in AIRPORT_OPTS if d == q.data)
-    await q.edit_message_text(
-        f"Kalkış: {label}\n\nNereye gitmek istiyorsun?",
-        reply_markup=kb_row(DEST_OPTS)
-    )
-    return S_DEST
-
-async def dest_chosen(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query
-    await q.answer()
-    if q.data == "CUSTOM":
-        await q.edit_message_text(
-            "Hedef havalimanının IATA kodunu yaz (örn: IST, AYT, ESB):"
-        )
-        return S_DEST
-    ctx.user_data["dest"] = q.data
-    label = next((l for l, d in DEST_OPTS if d == q.data), q.data)
-    await q.edit_message_text(
-        f"Hedef: {label}\n\nSeyahat türünü seç:",
+        f"{selamlama}\n\n"
+        "Ne yapmak istersin?",
         reply_markup=kb([
-            ("✈️ Sadece Gidiş", "one"),
-            ("🔄 Gidiş - Dönüş", "round"),
+            ("✈️ Uçuş Ara", "ara"),
+            ("🔔 Fiyat Alarmı Kur", "alarm"),
+            ("❓ Yardım", "yardim"),
         ])
     )
-    return S_TRIP
+    return S_MENU
 
-async def dest_custom(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """Kullanıcı IATA kodu yazdıysa."""
-    code = update.message.text.strip().upper()
-    if len(code) != 3 or not code.isalpha():
-        await update.message.reply_text(
-            "⚠️ Lütfen geçerli bir 3 harfli IATA kodu gir (örn: IST)."
+async def menu_sec(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    sec = q.data
+
+    if sec == "yardim":
+        await q.edit_message_text(
+            "🤖 Ne yapabilirim?\n\n"
+            "✈️ *Uçuş Ara* — Hangi havalimanından, hangi ay, gidiş mi dönüş mü söyle, "
+            "o ayın en ucuz biletini bulayım. Linki de vereyim.\n\n"
+            "🔔 *Fiyat Alarmı* — Belirli bir fiyatın altına düşünce seni haberdar edeyim. "
+            "Varsayılan 200€ ama sen de belirleyebilirsin.\n\n"
+            "Hangi rota? Varsayılan NRW → Sinop ama istersen başka yere de bakarım.",
+            parse_mode="Markdown",
+            reply_markup=kb([("🔙 Geri", "geri")])
         )
-        return S_DEST
-    ctx.user_data["dest"] = code
-    await update.message.reply_text(
-        f"Hedef: {code}\n\nSeyahat türünü seç:",
+        return S_MENU
+
+    if sec == "geri":
+        await q.edit_message_text(
+            "Ne yapmak istersin?",
+            reply_markup=kb([
+                ("✈️ Uçuş Ara", "ara"),
+                ("🔔 Fiyat Alarmı Kur", "alarm"),
+                ("❓ Yardım", "yardim"),
+            ])
+        )
+        return S_MENU
+
+    ctx.user_data["mod"] = sec  # "ara" veya "alarm"
+    await q.edit_message_text(
+        "Hangi havalimanından kalkacaksın?",
         reply_markup=kb([
-            ("✈️ Sadece Gidiş", "one"),
-            ("🔄 Gidiş - Dönüş", "round"),
+            ("🛫 Dortmund (DTM)", "DTM"),
+            ("🛫 Düsseldorf (DUS)", "DUS"),
+            ("🛫 Köln/Bonn (CGN)", "CGN"),
+            ("🌍 Hepsine Bak", "ALL"),
         ])
     )
-    return S_TRIP
+    return S_KALKIS
 
-async def trip_chosen(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+async def kalkis_sec(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
-    ctx.user_data["trip"] = q.data
+    ctx.user_data["kalkis"] = q.data
     await q.edit_message_text(
-        "🗓 Gidiş tarih aralığı?\n\n"
-        "Örnek: 15/07/2026 - 31/07/2026\n"
-        "(Başlangıç - Bitiş)"
-    )
-    return S_DEP_DATE
-
-async def dep_date_entered(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    text = update.message.text.strip()
-    # "15/07/2026 - 31/07/2026" veya "15/07/2026-31/07/2026"
-    parts = [p.strip() for p in text.replace(" - ","-").split("-", 2)]
-    # Eğer "-" ile ay/gün birbirine karışmasın diye "/" kontrolü
-    if len(parts) >= 2:
-        # Son deneme: DD/MM/YYYY-DD/MM/YYYY ya da DD/MM/YYYY - DD/MM/YYYY
-        raw = text.replace(" ","")
-        halves = raw.split("-",1) if raw.count("-")==1 else None
-        if halves is None:
-            # birden fazla - var, DD/MM/YYYY şeklinde split
-            idx = text.rfind(" - ")
-            if idx != -1:
-                halves = [text[:idx].strip(), text[idx+3:].strip()]
-            else:
-                halves = None
-
-        if halves:
-            d1 = parse_date(halves[0])
-            d2 = parse_date(halves[1])
-            if d1 and d2:
-                ctx.user_data["dep_from"] = d1
-                ctx.user_data["dep_to"]   = d2
-                if ctx.user_data.get("trip") == "round":
-                    await update.message.reply_text(
-                        "🗓 Dönüş tarih aralığı?\n\nÖrnek: 10/08/2026 - 31/08/2026"
-                    )
-                    return S_RET_DATE
-                else:
-                    await update.message.reply_text(
-                        "Hangi havayolunda arayım?",
-                        reply_markup=kb_row(AIRLINE_OPTS)
-                    )
-                    return S_AIRLINE
-
-    await update.message.reply_text(
-        "⚠️ Format anlaşılamadı. Şu şekilde gir:\n"
-        "15/07/2026 - 31/07/2026"
-    )
-    return S_DEP_DATE
-
-async def ret_date_entered(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    text = update.message.text.strip()
-    raw = text.replace(" ","")
-    idx = text.rfind(" - ")
-    if idx != -1:
-        halves = [text[:idx].strip(), text[idx+3:].strip()]
-    else:
-        halves = raw.split("-",1) if raw.count("-")==1 else [raw, raw]
-
-    d1 = parse_date(halves[0])
-    d2 = parse_date(halves[1]) if len(halves)>1 else d1
-    if d1 and d2:
-        ctx.user_data["ret_from"] = d1
-        ctx.user_data["ret_to"]   = d2
-        await update.message.reply_text(
-            "Hangi havayolunda arayım?",
-            reply_markup=kb_row(AIRLINE_OPTS)
-        )
-        return S_AIRLINE
-
-    await update.message.reply_text(
-        "⚠️ Format anlaşılamadı. Şu şekilde gir:\n"
-        "10/08/2026 - 31/08/2026"
-    )
-    return S_RET_DATE
-
-async def airline_chosen(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query
-    await q.answer()
-    ctx.user_data["airline"] = q.data
-    airline_label = next(l for l, d in AIRLINE_OPTS if d == q.data)
-
-    ud = ctx.user_data
-    origin = ud["origin"] if ud["origin"] != "ALL" else "DTM,DUS,CGN"
-    dest   = ud["dest"]
-    dep_f  = ud["dep_from"]
-    dep_t  = ud["dep_to"]
-    ret_f  = ud.get("ret_from")
-    ret_t  = ud.get("ret_to")
-    airline = ud["airline"]
-
-    await q.edit_message_text(
-        f"🔍 Aranıyor...\n"
-        f"{origin} → {dest}\n"
-        f"Gidiş: {dep_f} – {dep_t}\n"
-        f"{('Dönüş: '+ret_f+' – '+ret_t) if ret_f else 'Tek yön'}\n"
-        f"Havayolu: {airline_label}"
-    )
-
-    rate    = get_try_rate()
-    flights = search_kiwi(origin, dest, dep_f, dep_t, ret_f, ret_t, airline)
-
-    if not flights:
-        await q.message.reply_text(
-            "❌ Bu kriterlere uygun uçuş bulunamadı.\n"
-            "Tarih aralığını genişletmeyi veya farklı havayolu seçmeyi dene.\n\n"
-            "/start ile yeni arama yap."
-        )
-        return ConversationHandler.END
-
-    result_text, links = format_flights(flights, rate)
-    ctx.user_data["links"]   = links
-    ctx.user_data["rate"]    = rate
-    ctx.user_data["results"] = result_text
-
-    n = min(len(flights), 5)
-    emojis = ["1️⃣","2️⃣","3️⃣","4️⃣","5️⃣"]
-    link_btns = [(emojis[i], str(i)) for i in range(n)]
-    link_btns.append(("❌ İptal", "cancel"))
-
-    await q.message.reply_text(
-        f"✅ {n} sonuç bulundu!\n\n{result_text}"
-        f"Hangi biletin linkini istiyorsun?",
-        reply_markup=kb_row(link_btns)
-    )
-    return S_RESULTS
-
-async def result_selected(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query
-    await q.answer()
-
-    if q.data == "cancel":
-        await q.edit_message_text("İptal edildi. /start ile yeni arama yapabilirsin.")
-        return ConversationHandler.END
-
-    idx = int(q.data)
-    ctx.user_data["chosen_idx"] = idx
-    emojis = ["1️⃣","2️⃣","3️⃣","4️⃣","5️⃣"]
-
-    await q.edit_message_text(
-        f"{emojis[idx]} numaralı bilet için link göndereyim mi?",
+        "Nereye gidiyorsun?",
         reply_markup=kb([
-            ("✅ Evet, gönder", "yes"),
-            ("🔙 Geri dön",    "back"),
+            ("🏖 Sinop (NOP)", "NOP"),
+            ("✏️ Başka bir yer", "baska"),
         ])
     )
-    return S_CONFIRM
+    return S_VARIS_ONAY
 
-async def confirm_link(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+async def varis_onay(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    if q.data == "baska":
+        await q.edit_message_text(
+            "Tamam! Varış havalimanının IATA kodunu yaz.\n"
+            "(Örnek: IST, AYT, ESB, SAW)"
+        )
+        return S_VARIS_YAZ
+    ctx.user_data["varis"] = q.data
+    return await yon_sor(q)
+
+async def varis_yaz(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    kod = update.message.text.strip().upper()
+    if len(kod) != 3 or not kod.isalpha():
+        await update.message.reply_text("IATA kodu 3 harf olmalı. Tekrar yaz (örn: IST):")
+        return S_VARIS_YAZ
+    ctx.user_data["varis"] = kod
+    msg = await update.message.reply_text("...")
+    await msg.edit_text(
+        "Gidiş mi, dönüş mü, yoksa ikisi de mi?",
+        reply_markup=kb([
+            ("✈️ Gidiş", "gidis"),
+            ("🔙 Dönüş", "donus"),
+            ("↔️ İkisi De", "ikisi"),
+        ], cols=2)
+    )
+    return S_YON
+
+async def yon_sor(q):
+    await q.edit_message_text(
+        "Gidiş mi, dönüş mü, yoksa ikisi de mi?",
+        reply_markup=kb([
+            ("✈️ Gidiş", "gidis"),
+            ("🔙 Dönüş", "donus"),
+            ("↔️ İkisi De", "ikisi"),
+        ], cols=2)
+    )
+    return S_YON
+
+async def yon_sec(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    ctx.user_data["yon"] = q.data
+
+    butonlar = []
+    from datetime import date
+    today = date.today()
+    for i in range(6):
+        m = (today.month - 1 + i) % 12 + 1
+        y = today.year + (today.month - 1 + i) // 12
+        ms = f"{y}-{m:02d}"
+        butonlar.append((f"{MONTH_TR[m]} {y}", ms))
+    butonlar.append(("🔙 Geri", "geri_menu"))
+
+    await q.edit_message_text(
+        "Hangi ay?",
+        reply_markup=kb(butonlar, cols=2)
+    )
+    return S_AY
+
+async def ay_sec(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
 
-    if q.data == "back":
-        n = len(ctx.user_data.get("links", []))
-        emojis = ["1️⃣","2️⃣","3️⃣","4️⃣","5️⃣"]
-        link_btns = [(emojis[i], str(i)) for i in range(n)]
-        link_btns.append(("❌ İptal", "cancel"))
+    if q.data == "geri_menu":
         await q.edit_message_text(
-            ctx.user_data.get("results","") + "Hangi biletin linkini istiyorsun?",
-            reply_markup=kb_row(link_btns)
+            "Ne yapmak istersin?",
+            reply_markup=kb([
+                ("✈️ Uçuş Ara", "ara"),
+                ("🔔 Fiyat Alarmı Kur", "alarm"),
+                ("❓ Yardım", "yardim"),
+            ])
         )
-        return S_RESULTS
+        return S_MENU
 
-    idx  = ctx.user_data.get("chosen_idx", 0)
-    links = ctx.user_data.get("links", [])
-    link  = links[idx] if idx < len(links) else None
+    ctx.user_data["ay"] = q.data
+    mod    = ctx.user_data.get("mod", "ara")
+    kalkis = ctx.user_data.get("kalkis", "DTM")
+    varis  = ctx.user_data.get("varis", "NOP")
+    yon    = ctx.user_data.get("yon", "gidis")
+    ay     = q.data
 
-    if link:
+    if mod == "alarm":
         await q.edit_message_text(
-            f"🔗 Rezervasyon linkin:\n\n{link}\n\n"
-            f"⚠️ Fiyatlar anlık değişebilir, satın almadan önce teyit et.\n\n"
-            f"✈️ İyi yolculuklar! /start ile yeni arama yapabilirsin."
+            "Kaç €'nun altına düşünce haber vereyim?\n\n"
+            "Varsayılan 200€ ama sen de yazabilirsin.",
+            reply_markup=kb([
+                ("200€", "200"),
+                ("150€", "150"),
+                ("100€", "100"),
+                ("✏️ Kendim yazayım", "yaz"),
+            ], cols=2)
         )
-        # 200€ altıysa mail de gönder
-        if ctx.user_data.get("results","").count("🔥") > 0:
-            send_mail(
-                "🔥 FIRSAT — Bilet Rezervasyonu",
-                f"Seçilen bilet:\n\n{ctx.user_data.get('results','')}\n\nLink: {link}"
-            )
-    else:
-        await q.edit_message_text(
-            "⚠️ Link alınamadı. Kiwi.com'dan manuel arama yapabilirsin:\n"
-            "https://www.kiwi.com\n\n/start ile tekrar dene."
-        )
+        return S_ESIK_ONA
+
+    # Arama modunda direkt ara
+    await q.edit_message_text("🔍 Aranıyor, bir saniye...")
+    await _ara_ve_goster(q.message, ctx, kalkis, varis, yon, ay)
     return ConversationHandler.END
 
-async def cancel(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+async def esik_ona(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    if q.data == "yaz":
+        await q.edit_message_text("Tamam, kaç €? (Sadece sayı yaz, örn: 180)")
+        return S_ESIK_YAZ
+    ctx.user_data["esik"] = float(q.data)
+    await _alarm_kaydet(q.message, ctx)
+    return ConversationHandler.END
+
+async def esik_yaz(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    try:
+        esik = float(update.message.text.strip().replace("€","").replace(",","."))
+        ctx.user_data["esik"] = esik
+        await _alarm_kaydet(update.message, ctx)
+    except:
+        await update.message.reply_text("Sadece sayı yaz (örn: 180):")
+        return S_ESIK_YAZ
+    return ConversationHandler.END
+
+async def _alarm_kaydet(msg, ctx):
+    kalkis = ctx.user_data.get("kalkis", "DTM")
+    varis  = ctx.user_data.get("varis", "NOP")
+    yon    = ctx.user_data.get("yon", "gidis")
+    ay     = ctx.user_data.get("ay", "")
+    esik   = ctx.user_data.get("esik", 200)
+
+    # Alarm bilgisini environment variable olarak kaydedemeyiz,
+    # ama kullanıcıya netleştirici mesaj göster
+    yon_label = {"gidis": "Gidiş", "donus": "Dönüş", "ikisi": "Gidiş + Dönüş"}.get(yon, yon)
+    y, m = ay.split("-")
+    ay_label = f"{MONTH_TR[int(m)]} {y}"
+
+    await msg.reply_text(
+        f"✅ Alarm kuruldu!\n\n"
+        f"📍 {kalkis} → {varis}\n"
+        f"↔️ {yon_label}\n"
+        f"📅 {ay_label}\n"
+        f"🎯 Eşik: {esik:.0f}€\n\n"
+        f"Otomatik tarama her gün sabah, öğle ve akşam çalışıyor. "
+        f"Fiyat {esik:.0f}€ altına düşünce seni haberdar edeceğim! 🔔\n\n"
+        f"(Not: Alarm ayarı GitHub'daki THRESHOLD değişkenlerinden de güncellenebilir.)\n\n"
+        f"/start ile yeni arama yapabilirsin.",
+        reply_markup=kb([("🔁 Yeni Arama", "yeni")])
+    )
+
+async def _ara_ve_goster(msg, ctx, kalkis, varis, yon, ay):
+    rate = get_try_rate()
+    y, m = ay.split("-")
+    ay_label = f"{MONTH_TR[int(m)]} {y}"
+    yon_label = {"gidis": "Gidiş ✈️", "donus": "Dönüş 🔙", "ikisi": "Gidiş + Dönüş ↔️"}.get(yon, yon)
+    originler = ["DTM", "DUS", "CGN"] if kalkis == "ALL" else [kalkis]
+
+    sonuclar = []
+
+    for origin in originler:
+        if yon in ("gidis", "ikisi"):
+            r = search_route(origin, varis, ay)
+            if r:
+                sonuclar.append({
+                    "yon": "Gidiş",
+                    "kalkis": origin, "varis": varis,
+                    "fiyat": r["total"], "try": r["total"] * rate,
+                    "tarih": r["leg1"]["date"],
+                    "link": r["leg1"]["link"],
+                })
+        if yon in ("donus", "ikisi"):
+            r = search_route(varis, origin, ay)
+            if r:
+                sonuclar.append({
+                    "yon": "Dönüş",
+                    "kalkis": varis, "varis": origin,
+                    "fiyat": r["total"], "try": r["total"] * rate,
+                    "tarih": r["leg1"]["date"],
+                    "link": r["leg1"]["link"],
+                })
+
+    if not sonuclar:
+        await msg.reply_text(
+            f"😕 {ay_label} için sonuç bulunamadı.\n"
+            "Veriler henüz cache'te olmayabilir. Farklı bir ay dene!\n\n"
+            "/start ile yeni arama.",
+            reply_markup=kb([("🔁 Yeni Arama", "yeni")])
+        )
+        return
+
+    sonuclar.sort(key=lambda x: x["fiyat"])
+    lines = [f"✈️ {ay_label} — {yon_label}\n"]
+    ctx.user_data["sonuclar"] = sonuclar
+
+    for i, s in enumerate(sonuclar[:5], 1):
+        firsat = " 🔥" if s["fiyat"] <= 200 else ""
+        lines += [
+            f"{i}. {s['yon']}: {s['kalkis']} → {s['varis']}{firsat}",
+            f"   📅 {fmt_date(s['tarih'])}",
+            f"   💶 {s['fiyat']:.0f}€ ≈ {s['try']:,.0f}₺",
+            "",
+        ]
+    lines.append("Hangi biletin linkini istiyorsun? (1, 2, 3... gibi yaz)")
+
+    butonlar = [(str(i), f"link_{i-1}") for i in range(1, min(len(sonuclar)+1, 6))]
+    butonlar.append(("🔁 Yeni Arama", "yeni"))
+
+    await msg.reply_text(
+        "\n".join(lines),
+        reply_markup=kb(butonlar, cols=3)
+    )
+
+async def link_sec(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+
+    if q.data == "yeni":
+        ctx.user_data.clear()
+        await q.edit_message_text(
+            "Ne yapmak istersin?",
+            reply_markup=kb([
+                ("✈️ Uçuş Ara", "ara"),
+                ("🔔 Fiyat Alarmı Kur", "alarm"),
+                ("❓ Yardım", "yardim"),
+            ])
+        )
+        return S_MENU
+
+    if q.data.startswith("link_"):
+        idx      = int(q.data.split("_")[1])
+        sonuclar = ctx.user_data.get("sonuclar", [])
+        if idx >= len(sonuclar):
+            await q.answer("Bulunamadı.", show_alert=True)
+            return S_MENU
+        s    = sonuclar[idx]
+        link = s.get("link", "")
+
+        if link:
+            await q.edit_message_text(
+                f"İşte linkin! 🎉\n\n"
+                f"✈️ {s['yon']}: {s['kalkis']} → {s['varis']}\n"
+                f"📅 {fmt_date(s['tarih'])}\n"
+                f"💶 {s['fiyat']:.0f}€ ≈ {s['try']:,.0f}₺\n\n"
+                f"🔗 {link}\n\n"
+                f"⚠️ Fiyatlar değişebilir, almadan önce teyit et!\n\n"
+                f"İyi yolculuklar! ✈️",
+                reply_markup=kb([("🔁 Yeni Arama", "yeni")])
+            )
+            # 200€ altıysa mail de gönder
+            if s["fiyat"] <= 200:
+                send_mail(
+                    f"🔥 {s['fiyat']:.0f}€ — {s['kalkis']}→{s['varis']}",
+                    f"Tarih: {fmt_date(s['tarih'])}\nFiyat: {s['fiyat']:.0f}€\nLink: {link}"
+                )
+        else:
+            await q.edit_message_text(
+                f"✈️ {s['yon']}: {s['kalkis']} → {s['varis']}\n"
+                f"📅 {fmt_date(s['tarih'])}\n"
+                f"💶 {s['fiyat']:.0f}€ ≈ {s['try']:,.0f}₺\n\n"
+                f"Link için Aviasales'te ara:\n"
+                f"https://www.aviasales.com\n\n"
+                f"⚠️ Almadan önce teyit et!",
+                reply_markup=kb([("🔁 Yeni Arama", "yeni")])
+            )
+        return S_MENU
+
+    return S_MENU
+
+async def iptal(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     ctx.user_data.clear()
     await update.message.reply_text(
-        "İptal edildi. /start ile yeni arama yapabilirsin. ✈️"
+        "İptal ettim. /start ile tekrar başlayabilirsin. 👋"
     )
     return ConversationHandler.END
 
-async def fallback_msg(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+async def bilinmeyen(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "Merhaba! 👋 /start ile uçuş araması başlatabilirsin.\n\n"
-        "📋 Komutlar:\n"
-        "/start — Yeni arama\n"
-        "/iptal — Aramayı iptal et"
+        "Merhaba! 👋 /start yaz, seni yönlendireyim."
     )
-
-# ── Uygulama ──────────────────────────────────────────────
 
 def main():
     app = Application.builder().token(TG_TOKEN).build()
-
     conv = ConversationHandler(
         entry_points=[
             CommandHandler("start", start),
             MessageHandler(
-                filters.Regex(r"(?i)(merhaba|selam|hi|hello|hey|başla|baslat)"),
+                filters.Regex(r"(?i)(merhaba|selam|hi|hey|hello|başla|baslat|naber|nasılsın)"),
                 start
             ),
         ],
         states={
-            S_ORIGIN:   [CallbackQueryHandler(origin_chosen)],
-            S_DEST:     [
-                CallbackQueryHandler(dest_chosen),
-                MessageHandler(filters.TEXT & ~filters.COMMAND, dest_custom),
-            ],
-            S_TRIP:     [CallbackQueryHandler(trip_chosen)],
-            S_DEP_DATE: [MessageHandler(filters.TEXT & ~filters.COMMAND, dep_date_entered)],
-            S_RET_DATE: [MessageHandler(filters.TEXT & ~filters.COMMAND, ret_date_entered)],
-            S_AIRLINE:  [CallbackQueryHandler(airline_chosen)],
-            S_RESULTS:  [CallbackQueryHandler(result_selected)],
-            S_CONFIRM:  [CallbackQueryHandler(confirm_link)],
+            S_MENU:      [CallbackQueryHandler(menu_sec)],
+            S_KALKIS:    [CallbackQueryHandler(kalkis_sec)],
+            S_VARIS_ONAY:[CallbackQueryHandler(varis_onay)],
+            S_VARIS_YAZ: [MessageHandler(filters.TEXT & ~filters.COMMAND, varis_yaz)],
+            S_YON:       [CallbackQueryHandler(yon_sec)],
+            S_AY:        [CallbackQueryHandler(ay_sec),
+                          CallbackQueryHandler(link_sec, pattern="^(yeni|link_)")],
+            S_ESIK_ONA:  [CallbackQueryHandler(esik_ona)],
+            S_ESIK_YAZ:  [MessageHandler(filters.TEXT & ~filters.COMMAND, esik_yaz)],
         },
         fallbacks=[
-            CommandHandler("iptal", cancel),
-            CommandHandler("cancel", cancel),
+            CommandHandler("iptal", iptal),
+            CallbackQueryHandler(link_sec, pattern="^(yeni|link_)"),
         ],
         allow_reentry=True,
     )
-
     app.add_handler(conv)
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, fallback_msg))
-
-    log.info("Bot başlatılıyor (polling)...")
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, bilinmeyen))
+    logging.info("Bot başlatıldı!")
     app.run_polling(drop_pending_updates=True)
 
 if __name__ == "__main__":
