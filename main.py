@@ -1,183 +1,163 @@
-"""
-Otomatik fiyat izleme - günde 3 kez çalışır
-Fiyat düşünce veya eşiğin altına girince Telegram + mail bildirim
-"""
+    originler = ["DTM", "DUS", "CGN"] if kalkis == "ALL" else [kalkis]
+    sonuclar = []
 
-import os, json, smtplib
-from email.mime.text import MIMEText
-from datetime import date, timedelta
-from pathlib import Path
-import requests
+    for origin in originler:
+        if yon in ("gidis", "ikisi"):
+            api_results = search_own_api(origin, varis, ay, "gidis")
 
-TOKEN    = os.environ["TRAVELPAYOUTS_TOKEN"]
-TG_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
-TG_CHAT  = os.environ.get("TELEGRAM_CHAT_ID", "")
-GMAIL    = os.environ.get("GMAIL_ADDRESS", "")
-GPASS    = os.environ.get("GMAIL_APP_PASSWORD", "")
-MAILTO   = os.environ.get("EMAIL_TO", "")
+            for s in api_results:
+                s["try"] = s["fiyat"] * rate
+                sonuclar.append(s)
 
-ORIGINS  = ["DTM", "DUS", "CGN"]
-DEST     = "NOP"
-TRANSIT  = "IST"
-CURRENCY = "eur"
-MONTHS   = 6
-CHANGE   = 5.0   # bu kadar € değişirse bildirim
+        if yon in ("donus", "ikisi"):
+            api_results = search_own_api(varis, origin, ay, "donus")
 
-PRICES_FILE = Path(os.environ.get("PRICES_FILE", "/tmp/last_prices.json"))
+            for s in api_results:
+                s["try"] = s["fiyat"] * rate
+                sonuclar.append(s)
 
-MONTH_TR = {1:"Ocak",2:"Şubat",3:"Mart",4:"Nisan",5:"Mayıs",6:"Haziran",
-            7:"Temmuz",8:"Ağustos",9:"Eylül",10:"Ekim",11:"Kasım",12:"Aralık"}
-
-def load(): 
-    return json.loads(PRICES_FILE.read_text()) if PRICES_FILE.exists() else {}
-
-def save(p): 
-    PRICES_FILE.write_text(json.dumps(p, indent=2))
-
-def month_label(y, m): 
-    return f"{MONTH_TR[m]} {y}"
-
-def get_try_rate():
-    try:
-        r = requests.get("https://api.frankfurter.app/latest?from=EUR&to=TRY", timeout=8)
-        return r.json()["rates"]["TRY"]
-    except:
-        return 38.0
-
-def cheapest(origin, dest, month_str):
-    try:
-        r = requests.get(
-            "https://api.travelpayouts.com/v1/prices/cheap",
-            params={"origin": origin, "destination": dest,
-                    "depart_date": month_str, "currency": CURRENCY,
-                    "token": TOKEN},
-            timeout=20,
+    if not sonuclar:
+        await msg.reply_text(
+            f"{ay_label} icin sonuc bulunamadi.\n"
+            "Kendi API su an sonuc dondurmedi. Flight API calisiyor mu kontrol et.\n\n"
+            "/start ile yeni arama yapabilirsin.",
+            reply_markup=kb([("Yeni Arama", "yeni")]),
         )
-        if r.status_code != 200: return None
-        data = r.json().get("data", {}).get(dest)
-        if not data: return None
-        best = min(data.values(), key=lambda x: x["price"])
-        dep = best.get("departure_at", "")
-        return {"price": float(best["price"]), "date": dep[:10] if dep else month_str}
-    except: return None
-
-def fmt_date(s):
-    try:
-        parts = s[:10].split("-")
-        return f"{int(parts[2])} {MONTH_TR[int(parts[1])]} {parts[0]}"
-    except: return s
-
-def tg(msg):
-    if not TG_TOKEN or not TG_CHAT: return
-    try:
-        requests.post(
-            f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage",
-            data={"chat_id": TG_CHAT, "text": msg}, timeout=15
-        )
-    except: pass
-
-def mail(subject, body):
-    if not all([GMAIL, GPASS, MAILTO]): return
-    msg = MIMEText(body, "plain", "utf-8")
-    msg["Subject"] = subject
-    msg["From"] = GMAIL
-    msg["To"] = MAILTO
-    try:
-        with smtplib.SMTP_SSL("smtp.gmail.com", 465) as s:
-            s.login(GMAIL, GPASS)
-            s.send_message(msg)
-    except: pass
-
-def main():
-    today = date.today()
-    rate  = get_try_rate()
-    last  = load()
-    curr  = {}
-
-    # Kullanıcı tanımlı eşikler (varsayılan 200)
-    threshold_out = float(os.environ.get("THRESHOLD_OUTBOUND", "200"))
-    threshold_in  = float(os.environ.get("THRESHOLD_INBOUND", "200"))
-
-    alerts  = []
-    changes = []
-
-    for i in range(MONTHS):
-        m_idx = (today.month - 1 + i) % 12 + 1
-        y     = today.year + (today.month - 1 + i) // 12
-        ms    = f"{y}-{m_idx:02d}"
-        ml    = month_label(y, m_idx)
-
-        for origin in ORIGINS:
-            # GİDİŞ: origin → IST → NOP
-            k_out = f"gidis|{origin}|{ms}"
-            leg1  = cheapest(origin, TRANSIT, ms)
-            leg2  = cheapest(TRANSIT, DEST, ms) if leg1 else None
-            if leg1 and leg2:
-                total = leg1["price"] + leg2["price"]
-                curr[k_out] = total
-                info = {"yon": "Gidiş", "kalkis": origin, "varis": DEST,
-                        "ay": ml, "fiyat": total, "try": total * rate,
-                        "tarih": leg1["date"], "esik": threshold_out}
-                if total <= threshold_out:
-                    alerts.append(info)
-                elif k_out in last and abs(last[k_out] - total) >= CHANGE:
-                    info["onceki"] = last[k_out]
-                    changes.append(info)
-
-            # DÖNÜŞ: NOP → IST → origin
-            k_in  = f"donus|{origin}|{ms}"
-            leg1b = cheapest(DEST, TRANSIT, ms)
-            leg2b = cheapest(TRANSIT, origin, ms) if leg1b else None
-            if leg1b and leg2b:
-                total = leg1b["price"] + leg2b["price"]
-                curr[k_in] = total
-                info = {"yon": "Dönüş", "kalkis": DEST, "varis": origin,
-                        "ay": ml, "fiyat": total, "try": total * rate,
-                        "tarih": leg1b["date"], "esik": threshold_in}
-                if total <= threshold_in:
-                    alerts.append(info)
-                elif k_in in last and abs(last[k_in] - total) >= CHANGE:
-                    info["onceki"] = last[k_in]
-                    changes.append(info)
-
-    save(curr)
-
-    if not alerts and not changes:
-        print("Değişiklik yok, bildirim gönderilmedi.")
         return
 
-    # 🔥 FIRSAT bildirimi
-    if alerts:
-        alerts.sort(key=lambda x: x["fiyat"])
-        lines = ["🔥 Fırsat! Eşiğin altında bilet var:\n"]
-        for a in alerts[:5]:
-            lines += [
-                f"✈️ {a['yon']}: {a['kalkis']} → {a['varis']}",
-                f"📅 {fmt_date(a['tarih'])} | {a['ay']}",
-                f"💶 {a['fiyat']:.0f}€ ({a['try']:,.0f}₺)",
-                f"🎯 Eşiğin: {a['esik']:.0f}€",
-                "",
-            ]
-        lines.append("⚠️ Almadan önce THY/Aviasales'ten teyit et.")
-        msg = "\n".join(lines)
-        tg(msg)
-        mail("🔥 Fırsat — Ucuz Uçuş!", msg)
+    sonuclar.sort(key=lambda x: x["fiyat"])
+    ctx.user_data["sonuclar"] = sonuclar
 
-    # 📉 Değişiklik bildirimi  
-    if changes:
-        changes.sort(key=lambda x: x["fiyat"])
-        lines = ["📉 Fiyat değişikliği var:\n"]
-        for c in changes[:5]:
-            diff = c["onceki"] - c["fiyat"]
-            word = "ucuzladı" if diff > 0 else "pahalandı"
-            lines += [
-                f"{'📉' if diff>0 else '📈'} {c['yon']}: {c['kalkis']} → {c['varis']}",
-                f"📅 {c['ay']}",
-                f"💶 {c['onceki']:.0f}€ → {c['fiyat']:.0f}€  ({abs(diff):.0f}€ {word})",
-                "",
-            ]
-        lines.append("⚠️ Almadan önce THY/Aviasales'ten teyit et.")
-        tg("\n".join(lines))
+    lines = [f"{ay_label} - {yon_label}\n"]
+
+    for i, s in enumerate(sonuclar[:5], 1):
+        firsat = " FIRSAT" if s["fiyat"] <= 200 else ""
+        airline = s.get("airline", "Bilinmeyen")
+        provider = s.get("provider", "api")
+
+        lines += [
+            f"{i}. {s['yon']}: {s['kalkis']} -> {s['varis']}{firsat}",
+            f"   Havayolu: {airline}",
+            f"   Tarih: {fmt_date(s['tarih'])}",
+            f"   Fiyat: {s['fiyat']:.0f} euro yaklasik {s['try']:,.0f} TL",
+            f"   Kaynak: {provider}",
+            "",
+        ]
+
+    lines.append("Hangi biletin linkini istiyorsun?")
+
+    butonlar = [(str(i), f"link_{i-1}") for i in range(1, min(len(sonuclar) + 1, 6))]
+    butonlar.append(("Yeni Arama", "yeni"))
+
+    await msg.reply_text("\n".join(lines), reply_markup=kb(butonlar, cols=3))
+
+
+async def link_sec(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+
+    if q.data == "yeni":
+        ctx.user_data.clear()
+        await q.edit_message_text(
+            "Ne yapmak istersin?",
+            reply_markup=kb(
+                [
+                    ("Ucus Ara", "ara"),
+                    ("Fiyat Alarmi Kur", "alarm"),
+                    ("Yardim", "yardim"),
+                ]
+            ),
+        )
+        return S_MENU
+
+    if q.data.startswith("link_"):
+        idx = int(q.data.split("_")[1])
+        sonuclar = ctx.user_data.get("sonuclar", [])
+
+        if idx >= len(sonuclar):
+            await q.answer("Bulunamadi.", show_alert=True)
+            return S_MENU
+
+        s = sonuclar[idx]
+        link = s.get("link", "")
+
+        if link:
+            text = (
+                f"Iste linkin!\n\n"
+                f"{s['yon']}: {s['kalkis']} -> {s['varis']}\n"
+                f"Havayolu: {s.get('airline', 'Bilinmeyen')}\n"
+                f"Tarih: {fmt_date(s['tarih'])}\n"
+                f"Fiyat: {s['fiyat']:.0f} euro yaklasik {s['try']:,.0f} TL\n\n"
+                f"{link}\n\n"
+                f"Fiyatlar degisebilir, almadan once teyit et."
+            )
+        else:
+            text = (
+                f"{s['yon']}: {s['kalkis']} -> {s['varis']}\n"
+                f"Havayolu: {s.get('airline', 'Bilinmeyen')}\n"
+                f"Tarih: {fmt_date(s['tarih'])}\n"
+                f"Fiyat: {s['fiyat']:.0f} euro yaklasik {s['try']:,.0f} TL\n\n"
+                f"Bu kayitta link yok. Almadan once havayolu sitesinden teyit et."
+            )
+
+        await q.edit_message_text(text, reply_markup=kb([("Yeni Arama", "yeni")]))
+
+        if s["fiyat"] <= 200:
+            send_mail(
+                f"{s['fiyat']:.0f} euro - {s['kalkis']}->{s['varis']}",
+                text,
+            )
+
+        return S_MENU
+
+    return S_MENU
+
+
+async def iptal(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    ctx.user_data.clear()
+    await update.message.reply_text("Iptal ettim. /start ile tekrar baslayabilirsin.")
+    return ConversationHandler.END
+
+
+async def bilinmeyen(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("Merhaba! /start yaz, seni yonlendireyim.")
+
+
+def main():
+    app = Application.builder().token(TG_TOKEN).build()
+
+    conv = ConversationHandler(
+        entry_points=[
+            CommandHandler("start", start),
+            MessageHandler(
+                filters.Regex(r"(?i)(merhaba|selam|hi|hey|hello|basla|naber|nasilsin)"),
+                start,
+            ),
+        ],
+        states={
+            S_MENU: [CallbackQueryHandler(menu_sec)],
+            S_KALKIS: [CallbackQueryHandler(kalkis_sec)],
+            S_VARIS_ONAY: [CallbackQueryHandler(varis_onay)],
+            S_VARIS_YAZ: [MessageHandler(filters.TEXT & ~filters.COMMAND, varis_yaz)],
+            S_YON: [CallbackQueryHandler(yon_sec)],
+            S_AY: [CallbackQueryHandler(ay_sec)],
+            S_ESIK_ONA: [CallbackQueryHandler(esik_ona)],
+            S_ESIK_YAZ: [MessageHandler(filters.TEXT & ~filters.COMMAND, esik_yaz)],
+        },
+        fallbacks=[
+            CommandHandler("iptal", iptal),
+            CallbackQueryHandler(link_sec, pattern="^(yeni|link_)"),
+        ],
+        allow_reentry=True,
+    )
+
+    app.add_handler(conv)
+    app.add_handler(CallbackQueryHandler(link_sec, pattern="^(yeni|link_)"))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, bilinmeyen))
+
+    logging.info("Bot baslatildi!")
+    app.run_polling(drop_pending_updates=True)
+
 
 if __name__ == "__main__":
     main()
