@@ -1,3 +1,6 @@
+        "ikisi": "Gidis + Donus",
+    }.get(yon, yon)
+
     originler = ["DTM", "DUS", "CGN"] if kalkis == "ALL" else [kalkis]
     sonuclar = []
 
@@ -34,10 +37,12 @@
         firsat = " FIRSAT" if s["fiyat"] <= 200 else ""
         airline = s.get("airline", "Bilinmeyen")
         provider = s.get("provider", "api")
+        passenger_label = "Ogrenci" if s.get("passenger_type") == "student" else "Normal"
 
         lines += [
             f"{i}. {s['yon']}: {s['kalkis']} -> {s['varis']}{firsat}",
             f"   Havayolu: {airline}",
+            f"   Yolcu tipi: {passenger_label}",
             f"   Tarih: {fmt_date(s['tarih'])}",
             f"   Fiyat: {s['fiyat']:.0f} euro yaklasik {s['try']:,.0f} TL",
             f"   Kaynak: {provider}",
