@@ -1,32 +1,3 @@
-        "ikisi": "Gidis + Donus",
-    }.get(yon, yon)
-
-    originler = ["DTM", "DUS", "CGN"] if kalkis == "ALL" else [kalkis]
-    sonuclar = []
-
-    for origin in originler:
-        if yon in ("gidis", "ikisi"):
-            api_results = search_own_api(origin, varis, ay, "gidis")
-
-            for s in api_results:
-                s["try"] = s["fiyat"] * rate
-                sonuclar.append(s)
-
-        if yon in ("donus", "ikisi"):
-            api_results = search_own_api(varis, origin, ay, "donus")
-
-            for s in api_results:
-                s["try"] = s["fiyat"] * rate
-                sonuclar.append(s)
-
-    if not sonuclar:
-        await msg.reply_text(
-            f"{ay_label} icin sonuc bulunamadi.\n"
-            "Kendi API su an sonuc dondurmedi. Flight API calisiyor mu kontrol et.\n\n"
-            "/start ile yeni arama yapabilirsin.",
-            reply_markup=kb([("Yeni Arama", "yeni")]),
-        )
-        return
 
     sonuclar.sort(key=lambda x: x["fiyat"])
     ctx.user_data["sonuclar"] = sonuclar
@@ -129,6 +100,8 @@ async def bilinmeyen(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 
 def main():
+    start_health_server()
+
     app = Application.builder().token(TG_TOKEN).build()
 
     conv = ConversationHandler(
